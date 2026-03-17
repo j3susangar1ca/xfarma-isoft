@@ -242,40 +242,63 @@ BOOL DetectServiceTechnology(DWORD targetIp, PSERVICE_INFO pServiceInfo) {
     addr.sin_port = htons(pServiceInfo->port);
     addr.sin_addr.s_addr = targetIp;
 
-    struct timeval tv = { 2, 0 };
+    // Timeout de 3 segundos
+    struct timeval tv = { 3, 0 };
     setsockopt(s, SOL_SOCKET, SO_SNDTIMEO, (const char*)&tv, sizeof(tv));
     setsockopt(s, SOL_SOCKET, SO_RCVTIMEO, (const char*)&tv, sizeof(tv));
 
+    BOOL bResult = FALSE;
     if (connect(s, (struct sockaddr*)&addr, sizeof(addr)) == 0) {
-        // Enviar un payload genérico HTTP
-        const char* probe = "GET / HTTP/1.0\r\n\r\n";
-        send(s, probe, (int)strlen(probe), 0);
-
-        char buffer[1024] = { 0 };
-        int bytes = recv(s, buffer, sizeof(buffer) - 1, 0);
-        if (bytes > 0) {
-            buffer[bytes] = '\0'; // Asegurar null-termination
-            strncpy_s(pServiceInfo->banner, sizeof(pServiceInfo->banner), buffer, _TRUNCATE);
-
-            if (strstr(buffer, "Apache/2.4.38")) {
-                strcpy_s(pServiceInfo->technology, "Apache");
-                pServiceInfo->potential_cve_type = 5; // mod_rewrite
-            } else if (strstr(buffer, "Coyote/")) {
-                strcpy_s(pServiceInfo->technology, "Tomcat");
-                pServiceInfo->potential_cve_type = 1; // Ghostcat
-            } else if (strstr(buffer, "Log4j")) {
-                strcpy_s(pServiceInfo->technology, "Log4j");
-                pServiceInfo->potential_cve_type = 3; // Log4Shell
-            } else if (strstr(buffer, "PHP")) {
-                strcpy_s(pServiceInfo->technology, "PHP");
-                pServiceInfo->potential_cve_type = 4; // PHP-FPM
-            } else {
-                strcpy_s(pServiceInfo->technology, "Unknown");
+        const char* probe = "GET / HTTP/1.0\r\nHost: target\r\nUser-Agent: Mozilla/5.0\r\n\r\n";
+        int sent = send(s, probe, (int)strlen(probe), 0);
+        
+        if (sent > 0) {
+            char buffer[1024];
+            ZeroMemory(buffer, sizeof(buffer)); // Inicializar todo a cero
+            int bytes = recv(s, buffer, sizeof(buffer) - 1, 0); // Dejar espacio para null
+            
+            if (bytes > 0) {
+                buffer[bytes] = '\0'; // Garantizar null-termination
+                bResult = TRUE;
+                
+                // Copiar banner de forma segura
+                strncpy_s(pServiceInfo->banner, sizeof(pServiceInfo->banner), buffer, _TRUNCATE);
+                
+                // Detección de tecnologías
+                _strlwr_s(buffer, sizeof(buffer)); // Convertir a lowercase para comparación
+                
+                if (strstr(buffer, "apache/2.4.38") || strstr(buffer, "apache/2.4")) {
+                    strcpy_s(pServiceInfo->technology, sizeof(pServiceInfo->technology), "Apache");
+                    pServiceInfo->potential_cve_type = 5; // mod_rewrite
+                } 
+                else if (strstr(buffer, "coyote/") || strstr(buffer, "tomcat")) {
+                    strcpy_s(pServiceInfo->technology, sizeof(pServiceInfo->technology), "Tomcat");
+                    pServiceInfo->potential_cve_type = 1; // Ghostcat
+                } 
+                else if (strstr(buffer, "log4j") || strstr(buffer, "jndi")) {
+                    strcpy_s(pServiceInfo->technology, sizeof(pServiceInfo->technology), "Log4j");
+                    pServiceInfo->potential_cve_type = 3; // Log4Shell
+                } 
+                else if (strstr(buffer, "php") || strstr(buffer, "php-fpm")) {
+                    strcpy_s(pServiceInfo->technology, sizeof(pServiceInfo->technology), "PHP");
+                    pServiceInfo->potential_cve_type = 4; // PHP-FPM
+                } 
+                else if (strstr(buffer, "iis") || strstr(buffer, "microsoft-iis")) {
+                    strcpy_s(pServiceInfo->technology, sizeof(pServiceInfo->technology), "IIS");
+                    pServiceInfo->potential_cve_type = 2; // ASP.NET
+                }
+                else if (strstr(buffer, "nginx")) {
+                    strcpy_s(pServiceInfo->technology, sizeof(pServiceInfo->technology), "Nginx");
+                }
+                else {
+                    strcpy_s(pServiceInfo->technology, sizeof(pServiceInfo->technology), "Unknown");
+                }
             }
         }
     }
+    
     closesocket(s);
-    return TRUE;
+    return bResult;
 }
 
 /**
@@ -725,69 +748,122 @@ BOOL ProbeForSIGRed(const char* szIpAnsi) {
  */
 BOOL ScanForTargets(PTARGET_HOST pTargets, DWORD dwNumTargets) {
     WSADATA wsaData;
-    if (WSAStartup(MAKEWORD(2, 2), &wsaData) != 0) return FALSE;
+    int wsaResult = WSAStartup(MAKEWORD(2, 2), &wsaData);
+    if (wsaResult != 0) {
+        printf("[SCAN] WSAStartup falló: %d\n", wsaResult);
+        return FALSE;
+    }
 
     for (DWORD i = 0; i < dwNumTargets; i++) {
         printf("[SCAN] Escaneando: %ws\n", pTargets[i].szIpAddress);
 
         WORD ports[] = { 80, 443, 445, 3389, 8009, 9000, 11010, 42100, 47808 };
-        // Variables solo para iterar, las asignaciones específicas se hacen después
-        char szIpAnsi[16];
-        WideCharToMultiByte(CP_ACP, 0, pTargets[i].szIpAddress, -1, szIpAnsi, 16, NULL, NULL);
+        char szIpAnsi[16] = { 0 };
+        
+        if (!WideCharToMultiByte(CP_ACP, 0, pTargets[i].szIpAddress, -1, szIpAnsi, 16, NULL, NULL)) {
+            continue;
+        }
 
-        for (int j = 0; j < sizeof(ports)/sizeof(ports[0]); j++) {
+        // Validar IP
+        DWORD dwIpAddr = inet_addr(szIpAnsi);
+        if (dwIpAddr == INADDR_NONE || dwIpAddr == INADDR_ANY) {
+            printf("[SCAN] IP inválida: %s\n", szIpAnsi);
+            continue;
+        }
+
+        for (size_t j = 0; j < sizeof(ports)/sizeof(ports[0]); j++) {
             SOCKET s = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
-            if (s == INVALID_SOCKET) continue;
+            if (s == INVALID_SOCKET) {
+                printf("[SCAN] Error al crear socket: %d\n", WSAGetLastError());
+                continue;
+            }
 
-            ULONG nonBlocking = 1;
-            ioctlsocket(s, FIONBIO, &nonBlocking);
+            // Socket no bloqueante
+            u_long nonBlocking = 1;
+            if (ioctlsocket(s, FIONBIO, &nonBlocking) != 0) {
+                closesocket(s);
+                continue;
+            }
 
             struct sockaddr_in addr = { 0 };
             addr.sin_family = AF_INET;
             addr.sin_port = htons(ports[j]);
-            addr.sin_addr.s_addr = inet_addr(szIpAnsi);
+            addr.sin_addr.s_addr = dwIpAddr;
 
-            connect(s, (struct sockaddr*)&addr, sizeof(addr));
+            // Iniciar conexión no bloqueante
+            int connResult = connect(s, (struct sockaddr*)&addr, sizeof(addr));
+            if (connResult == SOCKET_ERROR && WSAGetLastError() != WSAEWOULDBLOCK) {
+                closesocket(s);
+                continue;
+            }
 
-            fd_set fdWrite;
+            // Esperar con select
+            fd_set fdWrite, fdExcept;
             FD_ZERO(&fdWrite);
+            FD_ZERO(&fdExcept);
             FD_SET(s, &fdWrite);
-            struct timeval tv = { 1, 0 };
+            FD_SET(s, &fdExcept);
+            
+            struct timeval tv = { 2, 0 }; // 2 segundos timeout
+            int selectResult = select(0, NULL, &fdWrite, &fdExcept, &tv);
 
-            if (select(0, NULL, &fdWrite, NULL, &tv) > 0) {
-                printf("[SCAN]   Puerto %d ABIERTO en %ws\n", ports[j], pTargets[i].szIpAddress);
+            if (selectResult > 0 && FD_ISSET(s, &fdWrite)) {
+                // Verificar que realmente se conectó (no error)
+                int so_error;
+                int len = sizeof(so_error);
+                getsockopt(s, SOL_SOCKET, SO_ERROR, (char*)&so_error, &len);
+                
+                if (so_error == 0) {
+                    printf("[SCAN]   Puerto %d ABIERTO en %ws\n", ports[j], pTargets[i].szIpAddress);
+                    
+                    // Detección de servicio
+                    SERVICE_INFO svcInfo = { 0 };
+                    svcInfo.port = ports[j];
+                    
+                    // Reconectar en modo bloqueante para banner grabbing
+                    closesocket(s);
+                    s = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+                    if (s != INVALID_SOCKET) {
+                        // Timeout para recv
+                        struct timeval tvBanner = { 5, 0 };
+                        setsockopt(s, SOL_SOCKET, SO_RCVTIMEO, (char*)&tvBanner, sizeof(tvBanner));
+                        setsockopt(s, SOL_SOCKET, SO_SNDTIMEO, (char*)&tvBanner, sizeof(tvBanner));
+                        
+                        if (connect(s, (struct sockaddr*)&addr, sizeof(addr)) == 0) {
+                            if (DetectServiceTechnology(dwIpAddr, &svcInfo)) {
+                                printf("[SCAN]     [%s] %s (CVE Type: %d)\n", 
+                                    svcInfo.technology, svcInfo.banner, svcInfo.potential_cve_type);
+                                
+                                if (g_NumDetectedServices < MAX_DETECTED_SERVICES) {
+                                    g_DetectedServices[g_NumDetectedServices++] = svcInfo;
+                                }
+                            }
+                        }
+                        closesocket(s);
+                    }
 
-                // *** NUEVO: Intentar detección ***
-                SERVICE_INFO svcInfo = { 0 };
-                svcInfo.port = ports[j];
-                if (DetectServiceTechnology(inet_addr(szIpAnsi), &svcInfo)) {
-                    printf("[SCAN]     Tech: %s - Pot. CVE Type: %d\n", svcInfo.technology, svcInfo.potential_cve_type);
-                    if (g_NumDetectedServices < MAX_DETECTED_SERVICES) {
-                        g_DetectedServices[g_NumDetectedServices++] = svcInfo;
+                    // Actualizar flags según puerto
+                    switch (ports[j]) {
+                        case 80:
+                        case 443:
+                            pTargets[i].bAspNetSmugglingVuln = DetectAspDotNetServices(szIpAnsi, (WORD)ports[j]);
+                            pTargets[i].bSsrfNtlmVuln = DetectPotentialSsrfEndpoints(szIpAnsi, (WORD)ports[j]);
+                            pTargets[i].bApacheRewriteVuln = TRUE;
+                            break;
+                        case 445: pTargets[i].bSmbAccessible = TRUE; break;
+                        case 3389: pTargets[i].bRdpAccessible = TRUE; break;
+                        case 8009: pTargets[i].bTomcatAjpAccessible = TRUE; break;
+                        case 9000: pTargets[i].bPhpFpmVuln = TRUE; break;
+                        case 11010: pTargets[i].bMorphoAccessible = TRUE; break;
+                        case 42100: pTargets[i].bLog4ShellVuln = TRUE; break;
+                        case 47808: pTargets[i].bBacnetVuln = TRUE; break;
                     }
                 }
-
-                // Asignar vulnerabilidades potenciales e flags operacionales basados en puerto
-                switch (ports[j]) {
-                    case 80:
-                    case 443:
-                        pTargets[i].bAspNetSmugglingVuln = DetectAspDotNetServices(szIpAnsi, ports[j]);
-                        pTargets[i].bSsrfNtlmVuln = DetectPotentialSsrfEndpoints(szIpAnsi, ports[j]);
-                        pTargets[i].bApacheRewriteVuln = TRUE; // Se asume potencial vulnerability en servidor web
-                        break;
-                    case 445: pTargets[i].bSmbAccessible = TRUE; break;
-                    case 3389: pTargets[i].bRdpAccessible = TRUE; break;
-                    case 8009: pTargets[i].bTomcatAjpAccessible = TRUE; break;
-                    case 9000: pTargets[i].bPhpFpmVuln = TRUE; break;
-                    case 11010: pTargets[i].bMorphoAccessible = TRUE; break;
-                    case 42100: pTargets[i].bLog4ShellVuln = TRUE; break; // Asumiendo Java/SOAP Morpho
-                    case 47808: pTargets[i].bBacnetVuln = TRUE; break;
-                }
             }
-            closesocket(s);
+            if (s != INVALID_SOCKET) closesocket(s);
         }
-
-        // Check for DNS (UDP 53)
+        
+        // Check DNS (UDP)
         pTargets[i].bSigRedVuln = ProbeForSIGRed(szIpAnsi);
     }
 
