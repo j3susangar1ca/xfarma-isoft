@@ -73,22 +73,32 @@ typedef struct _VX_TABLE {
 } VX_TABLE, *PVX_TABLE;
 
 __forceinline DWORD hash_ansi_optimized(const char* str) {
-    DWORD hash = 0x8200BEEF;
+    DWORD hash = 0x8200BEEF; 
     int c;
 
     while ((c = *str++)) {
+        // Convertir a lowercase manualmente (más rápido que tolower)
         if (c >= 'A' && c <= 'Z') {
-            c += 32;
+            c = c + ('a' - 'A'); // 32
         }
-        hash = ((hash << 5) + hash) + c;
+        hash = ((hash << 5) + hash) + c; // hash * 33 + c
     }
     return hash;
+}
+
+// Función auxiliar para validar que el puntero está dentro del módulo
+BOOL IsValidPEData(PVOID pModuleBase, PBYTE pAddress) {
+    PIMAGE_DOS_HEADER pDos = (PIMAGE_DOS_HEADER)pModuleBase;
+    PIMAGE_NT_HEADERS pNt = (PIMAGE_NT_HEADERS)((PBYTE)pModuleBase + pDos->e_lfanew);
+    DWORD dwSize = pNt->OptionalHeader.SizeOfImage;
+    return (pAddress >= (PBYTE)pModuleBase && pAddress < (PBYTE)pModuleBase + dwSize);
 }
 
 WORD GetSyscallNumber(PVOID pModuleBase, DWORD dwProcedureHash) {
     PIMAGE_DOS_HEADER pDosHeader = (PIMAGE_DOS_HEADER)pModuleBase;
     PIMAGE_NT_HEADERS pNtHeaders = (PIMAGE_NT_HEADERS)((PBYTE)pModuleBase + pDosHeader->e_lfanew);
-    PIMAGE_EXPORT_DIRECTORY pExportDirectory = (PIMAGE_EXPORT_DIRECTORY)((PBYTE)pModuleBase + pNtHeaders->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_EXPORT].VirtualAddress);
+    PIMAGE_EXPORT_DIRECTORY pExportDirectory = (PIMAGE_EXPORT_DIRECTORY)((PBYTE)pModuleBase + 
+        pNtHeaders->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_EXPORT].VirtualAddress);
 
     PDWORD pdwAddressOfFunctions = (PDWORD)((PBYTE)pModuleBase + pExportDirectory->AddressOfFunctions);
     PDWORD pdwAddressOfNames = (PDWORD)((PBYTE)pModuleBase + pExportDirectory->AddressOfNames);
@@ -96,47 +106,63 @@ WORD GetSyscallNumber(PVOID pModuleBase, DWORD dwProcedureHash) {
 
     for (WORD i = 0; i < pExportDirectory->NumberOfNames; i++) {
         const char* szFunctionName = (const char*)((PBYTE)pModuleBase + pdwAddressOfNames[i]);
-
+        
         if (hash_ansi_optimized(szFunctionName) == dwProcedureHash) {
             PBYTE pFunctionAddress = (PBYTE)pModuleBase + pdwAddressOfFunctions[pwAddressOfNameOrdinal[i]];
-
-            // Hell's Gate: Búsqueda en la propia función
+            
+            // Hell's Gate: Patrones de prólogo de syscall
             for (WORD cw = 0; cw < 32; cw++) {
-                // Patrón A: mov r10, rcx; mov eax, SSN (Estándar x64)
-                if (*(pFunctionAddress + cw) == 0x4C && *(pFunctionAddress + cw + 1) == 0x8B &&
+                // Patrón 1: mov r10, rcx; mov eax, SSN; syscall; ret (Windows 10/11 estándar)
+                if (*(pFunctionAddress + cw) == 0x4C && *(pFunctionAddress + cw + 1) == 0x8B && 
                     *(pFunctionAddress + cw + 2) == 0xD1 && *(pFunctionAddress + cw + 3) == 0xB8) {
-                    return *(PWORD)(pFunctionAddress + cw + 4);
+                    WORD wSyscall = *(PWORD)(pFunctionAddress + cw + 4);
+                    // Validar que sea un SSN razonable
+                    if (wSyscall > 0 && wSyscall < 0x2000) return wSyscall;
+                }
+                
+                // Patrón 2: mov eax, SSN (directo, algunas variantes)
+                if (*(pFunctionAddress + cw) == 0xB8) {
+                    // Verificar que siga syscall o ret cerca
+                    for (WORD k = 5; k < 24 && (cw + k) < 32; k++) {
+                        if (*(pFunctionAddress + cw + k) == 0x0F && *(pFunctionAddress + cw + k + 1) == 0x05) {
+                            DWORD dwSyscall = *(PDWORD)(pFunctionAddress + cw + 1);
+                            if (dwSyscall > 0 && dwSyscall < 0x2000) return (WORD)dwSyscall;
+                        }
                     }
-                    // Patrón B: mov eax, SSN; syscall (Variante Windows 11 / Syscall Hooked)
-                    if (*(pFunctionAddress + cw) == 0xB8) {
-                        for (WORD i = 5; i <= 14; i++) {
-                            if ((*(pFunctionAddress + cw + i) == 0x0F && *(pFunctionAddress + cw + i + 1) == 0x05) || *(pFunctionAddress + cw + i) == 0xC3) {
-                                return (WORD)*(PDWORD)(pFunctionAddress + cw + 1);
+                }
+            }
+
+            // Halo's Gate: Función hookeada, buscar en vecinos
+            BYTE bFirstByte = *pFunctionAddress;
+            if (bFirstByte == 0xE9 || bFirstByte == 0xC3 || bFirstByte == 0x48 || 
+                bFirstByte == 0xFF || bFirstByte == 0xEB) {
+                
+                // Buscar en funciones cercanas (32 bytes de separación típica)
+                for (WORD idx = 1; idx <= 600; idx++) {
+                    // Vecino Superior (direcciones mayores)
+                    PBYTE pNeighborAbove = pFunctionAddress + (idx * 32);
+                    if (IsValidPEData(pModuleBase, pNeighborAbove)) {
+                        for (WORD cw = 0; cw < 32; cw++) {
+                            if (*(pNeighborAbove + cw) == 0x4C && *(pNeighborAbove + cw + 1) == 0x8B && 
+                                *(pNeighborAbove + cw + 2) == 0xD1 && *(pNeighborAbove + cw + 3) == 0xB8) {
+                                WORD wNeighborSSN = *(PWORD)(pNeighborAbove + cw + 4);
+                                WORD wCalculated = wNeighborSSN - idx;
+                                if (wCalculated > 0 && wCalculated < 0x2000) return wCalculated;
                             }
                         }
                     }
-            }
-
-            // Halo's Gate: Si está ganchada (JMP, RET, etc.), buscar vecinos
-            if (*pFunctionAddress == 0xE9 || *pFunctionAddress == 0xC3 || *pFunctionAddress == 0x48) {
-                for (WORD idx = 1; idx <= 500; idx++) {
-                    // Vecino Superior
-                    PBYTE pNeighborAbove = pFunctionAddress + (idx * 32);
-                    for (WORD cw = 0; cw < 32; cw++) {
-                        if (*(pNeighborAbove + cw) == 0x4C && *(pNeighborAbove + cw + 1) == 0x8B &&
-                            *(pNeighborAbove + cw + 2) == 0xD1 && *(pNeighborAbove + cw + 3) == 0xB8) {
-                            WORD wID = *(PWORD)(pNeighborAbove + cw + 4) - idx;
-                        if (wID > 0 && wID < 0x1000) return wID;
-                            }
-                    }
-                    // Vecino Inferior
+                    
+                    // Vecino Inferior (direcciones menores)
                     PBYTE pNeighborBelow = pFunctionAddress - (idx * 32);
-                    for (WORD cw = 0; cw < 32; cw++) {
-                        if (*(pNeighborBelow + cw) == 0x4C && *(pNeighborBelow + cw + 1) == 0x8B &&
-                            *(pNeighborBelow + cw + 2) == 0xD1 && *(pNeighborBelow + cw + 3) == 0xB8) {
-                            WORD wID = *(PWORD)(pNeighborBelow + cw + 4) + idx;
-                        if (wID > 0 && wID < 0x1000) return wID;
+                    if (IsValidPEData(pModuleBase, pNeighborBelow)) {
+                        for (WORD cw = 0; cw < 32; cw++) {
+                            if (*(pNeighborBelow + cw) == 0x4C && *(pNeighborBelow + cw + 1) == 0x8B && 
+                                *(pNeighborBelow + cw + 2) == 0xD1 && *(pNeighborBelow + cw + 3) == 0xB8) {
+                                WORD wNeighborSSN = *(PWORD)(pNeighborBelow + cw + 4);
+                                WORD wCalculated = wNeighborSSN + idx;
+                                if (wCalculated > 0 && wCalculated < 0x2000) return wCalculated;
                             }
+                        }
                     }
                 }
             }
